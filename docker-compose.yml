@@ -1,0 +1,114 @@
+# InferLog — one-command local stack.
+#
+#   cp .env.example .env   # optional; add an OPENAI_API_KEY to enable GPT
+#   docker compose up --build
+#   open http://localhost:8088
+#
+# Six containers: Postgres, Redis, the chat gateway, the ingestion API,
+# the ingestion worker, and the web UI (nginx).
+name: inferlog
+
+x-postgres-dsn: &postgres-dsn
+  DATABASE_URL: postgresql://${POSTGRES_USER:-inferlog}:${POSTGRES_PASSWORD:-inferlog}@postgres:5432/${POSTGRES_DB:-inferlog}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-inferlog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-inferlog}
+      POSTGRES_DB: ${POSTGRES_DB:-inferlog}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Applied on first boot. Services also apply it idempotently at startup.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-inferlog}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    environment:
+      <<: *postgres-dsn
+      INGEST_URL: http://ingestion-api:8080/v1/ingest
+      INGEST_API_KEY: ${INGEST_API_KEY:-local-dev-ingest-key}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SCHEMA_PATH: /app/db/schema.sql
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Host port 8086 (8080 is a common local collision); container stays 8080.
+      - "8086:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ingestion-api:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    image: inferlog-ingestion
+    environment:
+      <<: *postgres-dsn
+      REDIS_URL: redis://redis:6379/0
+      INGEST_API_KEY: ${INGEST_API_KEY:-local-dev-ingest-key}
+      SCHEMA_PATH: /app/db/schema.sql
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    image: inferlog-ingestion
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *postgres-dsn
+      REDIS_URL: redis://redis:6379/0
+      SCHEMA_PATH: /app/db/schema.sql
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build: ./web
+    depends_on:
+      - gateway
+      - ingestion-api
+    ports:
+      - "8088:80"
+
+volumes:
+  pgdata:

@@ -1,0 +1,10 @@
+_notes/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/node_modules/
+web/dist/
+.git/
+.env
+*.md
+!README.md

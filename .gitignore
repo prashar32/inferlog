@@ -1,0 +1,27 @@
+# local design notes — not part of the submission
+_notes/
+
+# env / secrets
+.env
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# node / web
+node_modules/
+web/dist/
+*.log
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
