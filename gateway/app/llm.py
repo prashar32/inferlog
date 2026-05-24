@@ -1,25 +1,36 @@
 """LLM runtime: the model catalog and the chat-provider abstraction.
 
-In v0.3 the gateway demonstrates the SDK's HTTP-level capture: for OpenAI
-and Anthropic we instantiate the **native** SDK clients (no inferlog
-wrappers). inferlog's `httpx` patches intercept those calls and emit
-events automatically. The customer's experience is identical to ours.
+The gateway intentionally demonstrates ALL THREE inferlog integration
+modes side-by-side so it doubles as a customer-facing reference:
 
-For the offline `mock` provider — which doesn't go over HTTP and so
-isn't reachable by HTTP-level capture — we use inferlog's explicit
-`LoggedLLMClient` path. A contextvar inside that wrapper suppresses HTTP
-capture so we don't double-log if it ever did go over the wire.
+  * OpenAI provider  → Mode 1 (global capture). Native SDK client, no
+    inferlog plumbing at the call site. Captured because
+    `inferlog.init(capture_all_httpx=True)` patched httpx at startup.
+
+  * Anthropic provider → Mode 2 (per-client transport). Native SDK
+    client constructed with `http_client=httpx.AsyncClient(
+    transport=inferlog.transport())`. The transport is the surgical
+    opt-in: it makes capture explicit at the call site. When the global
+    patch is also active (the default), the transport defers to it to
+    avoid double-logging — flip `capture_all_httpx=False` at init and
+    only this client is captured.
+
+  * Mock provider → Mode 3 (in-process wrapper). The mock doesn't go
+    over HTTP at all, so neither of the httpx-based modes can see it.
+    `inferlog.wrap_provider(mock=MockProvider())` plugs it into the
+    same dispatcher + redactor; a contextvar prevents double-logging.
+
+All three paths produce identically-shaped `InferenceEvent`s.
 """
 
 from __future__ import annotations
 
 import logging
-import httpx
 from dataclasses import dataclass
 from typing import AsyncIterator
 
+import httpx
 import inferlog
-from inferlog import LoggedLLMClient
 from inferlog.providers import ChatMessage as SDKChatMessage, MockProvider
 
 from .config import Settings
@@ -92,7 +103,9 @@ class OpenAIChatProvider(ChatProvider):
     def __init__(self, api_key: str):
         import openai
 
-        self._client = openai.AsyncOpenAI(api_key=api_key, http_client=httpx.AsyncClient(transport=inferlog.transport()))
+        # Native client, no plumbing — inferlog's global httpx patch
+        # captures this call at the transport layer.
+        self._client = openai.AsyncOpenAI(api_key=api_key)
 
     async def stream(self, model, messages, **opts):
         stream = await self._client.chat.completions.create(
@@ -124,7 +137,18 @@ class AnthropicChatProvider(ChatProvider):
     def __init__(self, api_key: str):
         import anthropic
 
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        # Mode 2 (per-client transport) demo. The customer constructs a
+        # native Anthropic client but passes an httpx client whose
+        # transport is `inferlog.transport()`. This is the surgical
+        # opt-in — capture is wired here, visibly, instead of through a
+        # process-wide patch. With `capture_all_httpx=True` (the default
+        # in this demo) the global patch is active and this transport
+        # gracefully steps aside; set `capture_all_httpx=False` at init
+        # to make this transport the *only* capture path for this client.
+        self._client = anthropic.AsyncAnthropic(
+            api_key=api_key,
+            http_client=httpx.AsyncClient(transport=inferlog.transport()),
+        )
 
     async def stream(self, model, messages, max_tokens: int = 1024, **opts):
         system = next((m.content for m in messages if m.role == "system"), None)
@@ -163,17 +187,11 @@ class AnthropicChatProvider(ChatProvider):
 
 class MockChatProvider(ChatProvider):
     """The mock model is in-process; nothing leaves the host, so HTTP
-    capture won't see it. The explicit-wrapper path emits events for us."""
+    capture won't see it. `inferlog.wrap_provider()` plugs it into the
+    same dispatcher + redactor the auto-instrumentation path uses."""
 
     def __init__(self):
-        rt = inferlog.get_runtime()
-        assert rt is not None, "inferlog.init() must be called before MockChatProvider"
-        self._client = LoggedLLMClient(
-            service=rt.service,
-            dispatcher=rt.dispatcher,
-            redactor=rt.redactor,
-            providers={"mock": MockProvider(token_delay=0.02)},
-        )
+        self._client = inferlog.wrap_provider(mock=MockProvider(token_delay=0.02))
 
     async def stream(self, model, messages, **opts):
         sdk_messages = [SDKChatMessage(m.role, m.content) for m in messages]
@@ -202,14 +220,28 @@ class LLMRuntime:
 
     @classmethod
     def build(cls, settings: Settings) -> "LLMRuntime":
-        # Single line — patches httpx, sets up dispatcher + redactor +
-        # sampler. From here on, every LLM call going through httpx is
-        # captured automatically, no matter which library makes it.
+        # ──────────────────────────────────────────────────────────────
+        # inferlog SDK — single-line init.
+        #
+        # `capture_all_httpx=True` (the default; spelt out here for
+        # clarity) globally patches httpx.AsyncClient.send and
+        # httpx.Client.send. After this returns, every LLM HTTP call the
+        # process makes — via any library — is captured automatically.
+        # Non-LLM httpx traffic is recognised by URL and passes through
+        # untouched (see sdk/inferlog/parsers.py — handlers check host /
+        # path and return None for anything they don't recognise).
+        #
+        # This is the recommended customer integration. The alternative
+        # (per-client `inferlog.transport()`) is also supported and is
+        # demonstrated by AnthropicChatProvider above — useful when a
+        # customer cannot accept a process-wide monkey-patch on httpx
+        # and prefers to mark each captured client explicitly.
+        # ──────────────────────────────────────────────────────────────
         installed = inferlog.init(
             service="chat-gateway",
             endpoint=settings.ingest_url,
             api_key=settings.ingest_api_key,
-            capture_all_httpx=False,
+            capture_all_httpx=True,
         )
         log.info("inferlog initialised; transports patched: %s", installed)
 

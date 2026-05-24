@@ -46,7 +46,7 @@ from .dispatcher import (
     TransientDeliveryError,
 )
 from .events import SDK_VERSION, InferenceEvent
-from .providers import ChatMessage, Completion, StreamChunk, Usage
+from .providers import ChatMessage, Completion, Provider, StreamChunk, Usage
 from .redaction import Redactor
 from .runtime import (
     Runtime,
@@ -186,10 +186,53 @@ def init(
         "inferlog initialised (service=%s, enabled=%s, endpoint=%s)",
         service, enabled, endpoint or "<null>",
     )
+    # Surface the silent-NullSink trap loudly. Tests and CI typically
+    # construct their own MemorySink; a real app wiring init() with no
+    # endpoint and no sink almost always wants to know it's a no-op.
+    if enabled and endpoint is None and sink is None:
+        log.warning(
+            "inferlog: enabled=True but neither endpoint nor sink was given — "
+            "events will be discarded (NullSink). Pass endpoint=... to ship them."
+        )
 
     if not capture_all_httpx or not enabled:
         return []
     return _auto.install(rt)
+
+
+def wrap_provider(**providers: Provider) -> LoggedLLMClient:
+    """Wrap one or more in-process providers so their calls produce events.
+
+    Use this only for providers that do NOT speak HTTP — mocks, custom
+    in-house inference, anything that wouldn't otherwise reach our
+    httpx-level capture. For OpenAI / Anthropic / Ollama / vLLM /
+    OpenAI-compatible proxies, you don't need this: `inferlog.init(...)`
+    already captures them at the transport layer.
+
+    Requires `inferlog.init(...)` to have been called first — the client
+    is wired to the global runtime's dispatcher and redactor so events
+    are shaped identically to the auto-instrumentation path.
+
+        inferlog.init(...)
+        client = inferlog.wrap_provider(mock=MockProvider())
+        async for chunk in client.stream(
+            provider="mock", model="m-1", messages=[ChatMessage("user", "hi")]
+        ):
+            ...
+    """
+    rt = get_runtime()
+    if rt is None:
+        raise RuntimeError(
+            "inferlog.wrap_provider(): call inferlog.init(...) first."
+        )
+    if not providers:
+        raise ValueError("inferlog.wrap_provider(): pass at least one provider.")
+    return LoggedLLMClient(
+        service=rt.service,
+        dispatcher=rt.dispatcher,
+        redactor=rt.redactor,
+        providers=dict(providers),
+    )
 
 
 def _ensure_atexit_handler() -> None:
@@ -286,14 +329,15 @@ def stats() -> dict:
 __all__ = [
     # Public API
     "init", "shutdown", "ashutdown", "flush", "stats", "context", "transport",
+    "wrap_provider",
     # Building blocks customers compose
     "Redactor", "Runtime",
     "Sampler", "KeepAll", "Probability", "AlwaysKeepErrors", "CustomSampler",
-    # Explicit-wrapper API (legacy / custom providers)
+    # Explicit-wrapper API (custom in-process providers)
     "LoggedLLMClient", "LogDispatcher",
     "HttpSink", "MemorySink", "NullSink", "TransientDeliveryError",
     "InferenceEvent", "SDK_VERSION",
-    "ChatMessage", "Completion", "StreamChunk", "Usage",
+    "ChatMessage", "Completion", "Provider", "StreamChunk", "Usage",
     # Low-level helpers
     "get_runtime", "is_initialized", "current_tags",
 ]

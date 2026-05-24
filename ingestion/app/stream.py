@@ -98,6 +98,14 @@ class EventStream:
     async def depth(self) -> int:
         return await self._redis.xlen(self._stream)
 
+    async def dlq_depth(self) -> int:
+        """Number of parked (poison) messages in the DLQ. Surfaces silent
+        data loss — alert when this rises."""
+        try:
+            return await self._redis.xlen(self._dlq)
+        except ResponseError:
+            return 0
+
     async def pending_count(self) -> int:
         try:
             info = await self._redis.xpending(self._stream, self._group)

@@ -109,65 +109,53 @@ async def send_message(
     request_id = str(uuid4())
 
     async def stream():
-        collected: list[str] = []
-        usage = None
-        yield _sse("start", {"request_id": request_id})
+        # `with inferlog.context(...)` wraps the async-generator body.
+        # contextvars propagate cleanly across `await`/`yield`, so every
+        # event emitted by the SDK while we're producing tokens carries
+        # the conversation_id tag — both the HTTP-captured (OpenAI /
+        # Anthropic) path and the explicit-wrapper (mock) path.
+        with inferlog.context(conversation_id=str(conversation_id)):
+            collected: list[str] = []
+            usage = None
+            yield _sse("start", {"request_id": request_id})
 
-        # The gateway's LLMRuntime.stream returns a normalised async
-        # iterator of StreamChunk(text, usage) regardless of which
-        # provider is underneath. OpenAI / Anthropic chunks are produced
-        # via native SDKs (HTTP-captured by inferlog); the mock provider
-        # goes through the explicit-wrapper path inside the runtime.
-        #
-        # inferlog.context() attaches the conversation_id to every event
-        # emitted in this scope — works for both capture paths.
-        ctx = inferlog.context(conversation_id=str(conversation_id))
-        ctx.__enter__()
-        sdk_stream = llm.stream(
-            provider=conv["provider"],
-            model=conv["model"],
-            messages=context,
-        )
-        try:
-            async for chunk in sdk_stream:
-                if chunk.text:
-                    collected.append(chunk.text)
-                    yield _sse("token", {"text": chunk.text})
-                if chunk.usage:
-                    usage = chunk.usage
-            # ---- completed normally ----
-            await _persist_assistant_turn(
-                db, conversation_id, request_id, "".join(collected), usage, "complete"
+            sdk_stream = llm.stream(
+                provider=conv["provider"],
+                model=conv["model"],
+                messages=context,
             )
-            yield _sse("done", {"request_id": request_id, "usage": _usage_dict(usage)})
-        except (asyncio.CancelledError, GeneratorExit):
-            # User hit Stop / disconnected. Persist the partial answer off the
-            # request path — awaiting here during cancellation is unsafe.
-            _spawn_persist(
-                db, conversation_id, request_id, "".join(collected), usage, "cancelled"
-            )
-            raise
-        except Exception as exc:
-            log.exception("generation failed for conversation %s", conversation_id)
-            _spawn_persist(
-                db, conversation_id, request_id, "".join(collected), usage, "error"
-            )
-            # Surface a useful (truncated) reason — this is an observability
-            # tool, so hiding the actual error would be the wrong instinct.
-            reason = " ".join(str(exc).split())[:240] or "unknown error"
-            yield _sse("error", {"message": f"Model request failed — {reason}"})
-        finally:
-            # Closing the SDK stream is what makes it emit its log line
-            # (success/cancelled/error) — so this must always run.
             try:
-                await sdk_stream.aclose()
-            except Exception:
-                log.debug("sdk stream close raised", exc_info=True)
-            # Pop the inferlog.context scope. No-raise — just resets the
-            # contextvar token.
-            try:
-                ctx.__exit__(None, None, None)
-            except Exception:
-                log.debug("inferlog context exit raised", exc_info=True)
+                async for chunk in sdk_stream:
+                    if chunk.text:
+                        collected.append(chunk.text)
+                        yield _sse("token", {"text": chunk.text})
+                    if chunk.usage:
+                        usage = chunk.usage
+                # ---- completed normally ----
+                await _persist_assistant_turn(
+                    db, conversation_id, request_id, "".join(collected), usage, "complete"
+                )
+                yield _sse("done", {"request_id": request_id, "usage": _usage_dict(usage)})
+            except (asyncio.CancelledError, GeneratorExit):
+                # User hit Stop / disconnected. Persist the partial answer off
+                # the request path — awaiting here during cancellation is unsafe.
+                _spawn_persist(
+                    db, conversation_id, request_id, "".join(collected), usage, "cancelled"
+                )
+                raise
+            except Exception as exc:
+                log.exception("generation failed for conversation %s", conversation_id)
+                _spawn_persist(
+                    db, conversation_id, request_id, "".join(collected), usage, "error"
+                )
+                reason = " ".join(str(exc).split())[:240] or "unknown error"
+                yield _sse("error", {"message": f"Model request failed — {reason}"})
+            finally:
+                # Closing the SDK stream is what makes it emit its log line
+                # (success/cancelled/error) — so this must always run.
+                try:
+                    await sdk_stream.aclose()
+                except Exception:
+                    log.debug("sdk stream close raised", exc_info=True)
 
     return StreamingResponse(stream(), media_type="text/event-stream")

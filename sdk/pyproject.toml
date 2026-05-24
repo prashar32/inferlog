@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inferlog"
-version = "0.3.0"
+version = "0.4.0"
 description = "Model-agnostic inference logging — one-line init, HTTP-level capture, PII-redacted previews"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,11 +12,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Convenience installs of the vendor SDKs. The SDK itself never imports
-# them — capture is HTTP-level — but apps that use these libs will need
-# them in their environment.
-openai = ["openai>=1.40,<2.0"]
-anthropic = ["anthropic>=0.39,<1.0"]
+# The SDK has no runtime dependency on any vendor LLM library — capture is
+# at the httpx layer. Apps install whichever provider SDKs they actually
+# use themselves; there's no need to pull them in through `inferlog[...]`.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

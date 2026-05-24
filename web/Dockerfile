@@ -8,6 +8,10 @@ COPY . .
 RUN npm run build
 
 FROM nginx:1.27-alpine
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# The nginx image runs envsubst on files in /etc/nginx/templates at
+# startup and writes the result into /etc/nginx/conf.d. We restrict
+# substitution to a known env var so nginx-native $variables aren't
+# mangled (see NGINX_ENVSUBST_FILTER in docker-compose.yml).
+COPY default.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 80

@@ -53,12 +53,12 @@ drops the database volume).
 | Lightweight logging SDK / wrapper | `sdk/` (`inferlog`) |
 | Ingestion service | `ingestion/` (API) |
 | Database storage | `db/schema.sql` — Postgres |
-| Multi-provider support | `sdk/inferlog/providers/` (openai, anthropic, mock) |
+| Multi-provider support | `sdk/inferlog/parsers.py` — OpenAI, Anthropic, Ollama, OpenAI-compatible (vLLM / Together / OpenRouter / LiteLLM); register your own with `add_handler(...)` |
 | Streaming responses | SSE, gateway → browser |
 | Latency / throughput / error dashboards | `web/` Dashboard tab |
 | One-command setup | `docker compose up` |
 | Event-based architecture | Redis Streams between API and worker |
-| PII redaction | `ingestion/app/redaction.py` |
+| PII redaction | `sdk/inferlog/redaction.py` — runs **in-process** before any event leaves the customer; optional defense-in-depth pass at `ingestion/app/redaction.py` |
 | Cancel / list / resume conversations | Chat tab |
 
 The Kubernetes deployment bonus is intentionally not included.
@@ -114,9 +114,10 @@ A longer write-up — ingestion flow, failure handling, scaling — is in
 ### Using the SDK in your own app
 
 The SDK is designed to be the thing a customer drops into their own
-backend. Two integration paths:
+backend, like New Relic or Prometheus — one-line init at startup, then
+invisible. Two integration patterns; both stay supported:
 
-**1. Auto-instrumentation (one line, recommended).**
+**1. Global capture (default — recommended).**
 
 ```python
 import inferlog
@@ -126,21 +127,50 @@ inferlog.init(
     api_key="...",
 )
 
-# Your existing code is unchanged — auto-captured:
+# Existing code is unchanged. Native vendor SDKs, captured at the
+# transport layer regardless of which library makes the call:
 resp = await openai_client.chat.completions.create(model="gpt-4o-mini", ...)
+resp = await anthropic_client.messages.create(model="claude-...", ...)
 
-# Optional: tag a scope so the events carry context
+# Optional: tag a scope so every event inside it carries the context.
 with inferlog.context(conversation_id=cid, user_id=uid, tenant_id=tid):
     await openai_client.chat.completions.create(...)
 ```
 
-`init()` returns the list of providers it actually instrumented
-(`openai`, `anthropic`); auto-instrumentation only patches libraries that
-are importable in your process.
+`init(capture_all_httpx=True)` (the default) patches `httpx.Client.send`
+and `httpx.AsyncClient.send` once at startup. **Non-LLM httpx calls are
+not logged** — every patched call checks the URL against a small set of
+provider handlers (`openai.com`, `anthropic`, `/api/chat`, …) and bails
+out immediately if nothing matches. The overhead on non-LLM traffic is a
+handful of string comparisons.
 
-**2. Explicit wrapper.** For custom or in-house providers there's
-`LoggedLLMClient`. It shares the same dispatcher + redactor, so events
-look identical regardless of which path produced them.
+**2. Surgical capture (opt-in, per-client).** Prefer this when you don't
+want our patch sitting on every httpx call in the process — for example
+if you have a lot of non-LLM httpx traffic and want zero coupling.
+
+```python
+inferlog.init(..., capture_all_httpx=False)
+
+openai_client = openai.AsyncOpenAI(
+    api_key=...,
+    http_client=httpx.AsyncClient(transport=inferlog.transport()),
+)
+```
+
+**3. In-process custom providers.** For models that don't speak HTTP
+(mocks, custom in-house inference), `inferlog.wrap_provider(...)` plugs
+them into the same dispatcher and redactor as the auto-captured path:
+
+```python
+from inferlog.providers import MockProvider, ChatMessage
+
+inferlog.init(...)
+client = inferlog.wrap_provider(mock=MockProvider())
+async for chunk in client.stream(
+    provider="mock", model="m-1", messages=[ChatMessage("user", "hi")],
+):
+    ...
+```
 
 The SDK ships with the production essentials you'd expect:
 
@@ -151,6 +181,7 @@ The SDK ships with the production essentials you'd expect:
 | **Backpressure** | Bounded queue with `on_drop(count, reason)` callback; reasons: `queue_full`, `max_retries`, `permanent_error`, `sampled` |
 | **Network resilience** | Retry with exponential backoff + jitter; honours `Retry-After` on 429 / 503 |
 | **Auth** | `auth_scheme="x-api-key"` (default) or `"bearer"` |
+| **Per-event size caps** | `error_message`, `tags`, `client_metadata` are bounded at the SDK boundary — a buggy call site can't ship multi-MB events |
 | **Shutdown** | `atexit` flush on process exit; `await inferlog.ashutdown()` for clean async drain |
 | **Observability of the logger itself** | `inferlog.stats()` returns queue depth, delivered, dropped, closed |
 | **Safety** | Every wrapper is in `try/except` — the SDK will not break your call path |
@@ -158,12 +189,15 @@ The SDK ships with the production essentials you'd expect:
 ### Repo layout
 
 ```
-sdk/         inferlog — the logging SDK (provider adapters, dispatcher, client)
+sdk/         inferlog — the logging SDK (httpx capture, dispatcher, redactor)
 gateway/     chat backend: conversations, multi-turn context, SSE streaming
 ingestion/   ingestion API + stream worker (one image, two entrypoints)
 web/         React UI — chat + dashboards
 db/schema.sql   the shared Postgres schema
 scripts/seed.py synthetic data generator for the dashboard
+examples/    customer-side integration snippets (custom HTTP provider,
+             in-process provider) — what the customer's codebase looks
+             like before/after adding the SDK
 ```
 
 ---
@@ -246,9 +280,17 @@ Things I'd do differently with more time, or chose deliberately:
   rollup table refreshed on a schedule) once log volume is real.
 - Per-`conversation_id` log views in the UI, joining `messages` to
   `inference_logs` so you can see the cost/latency of a specific chat.
-- Auth on the whole thing — right now only the SDK→ingestion hop is
-  authenticated (a shared key); the browser-facing APIs are open.
-- Replace the single-key ingestion auth with per-service credentials.
+- Auth on the gateway's own conversation APIs — only the SDK→ingestion
+  hop and the dashboard reads are authenticated today; the chat APIs
+  themselves are open (the assumption is that the customer's existing
+  app auth sits in front of the gateway).
+- Per-customer API keys instead of a single shared `INGEST_API_KEY` —
+  needed for multi-tenancy. The auth dependency is already pluggable;
+  the change is the storage and rotation tooling around it.
+- Rate limiting on `POST /v1/ingest` with a 429 + `Retry-After` so the
+  SDK's existing backoff loop has something to react to under burst
+  load (today we return 500 if Redis is down; the SDK retries that
+  transiently, but a dedicated 429 path is cleaner).
 - A proper migration tool (Alembic) instead of an idempotent `schema.sql`.
 
 ---
@@ -276,12 +318,16 @@ make test
 
 Brings up Postgres + Redis and runs three suites inside the service images:
 
-- **SDK** (13) — dispatcher batching/retry/drop, the client wrapper,
-  error classification, cancellation logging.
+- **SDK** (66) — dispatcher batching/retry/drop, the explicit-wrapper
+  client, HTTP-level capture across OpenAI / Anthropic / Ollama /
+  OpenAI-compatible shapes, transport-mode capture, `wrap_provider`,
+  per-event size caps, error classification, cancellation logging.
 - **Gateway** (10) — conversation CRUD, streaming, multi-turn context,
   cancellation persisting a partial turn.
-- **Ingestion** (25) — redaction, enrichment, the ingest API, and the
-  worker (storage, idempotency, PII, DLQ).
+- **Ingestion** (33) — redaction, enrichment, the ingest API (auth on
+  both write and dashboard reads, bearer + x-api-key, oversized-field
+  rejection, DLQ visibility), and the worker (storage, idempotency, PII,
+  DLQ).
 
 The suites use the offline mock provider, so they need no API keys and make
 no external calls.
@@ -302,9 +348,16 @@ POST   /v1/conversations/{id}/messages        {content}  → SSE stream
 Ingestion (`/api/ingestion`, or `:8081`):
 
 ```
-POST   /v1/ingest                  batch of events  (x-api-key required)
+POST   /v1/ingest                  batch of events
 GET    /v1/metrics/summary?window=
 GET    /v1/metrics/timeseries?window=&bucket=
 GET    /v1/metrics/errors?window=
 GET    /v1/logs?limit=&status=&conversation_id=
+GET    /healthz                    unauth — db/redis ping + stream/DLQ depth
 ```
+
+**Every** endpoint above except `/healthz` requires the shared secret —
+`x-api-key: <INGEST_API_KEY>` (preferred) or `Authorization: Bearer <…>`
+(parity with the SDK's `auth_scheme="bearer"` option). The web dashboard
+hits these via nginx, which injects the header on the way through so the
+browser never sees the key.

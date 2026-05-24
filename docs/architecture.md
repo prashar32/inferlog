@@ -6,29 +6,51 @@ SDK contract a customer integrates against.
 
 ## The product picture
 
-The SDK lives **inside the customer's application**, not inside our
-infrastructure. That single fact dictates two design rules:
+The system has three trust boundaries:
+
+```
+┌─ customer process ────────┐   ┌─ Ollive (private) ────────────────┐
+│  gateway / app code       │   │  ingestion API → worker → Postgres│
+│    └─ inferlog SDK   ─────┼──▶│  dashboards (auth-gated reads)    │
+│        (init + redact)    │   │                                   │
+└───────────────────────────┘   └───────────────────────────────────┘
+```
+
+* **The gateway / app** is the customer's code. Ollive ships them the
+  SDK and nothing else.
+* **The SDK** lives inside the customer's process. It owns capture,
+  redaction, batching, and delivery.
+* **The ingestion service + worker** are Ollive's private backend. They
+  are never exposed to the customer's runtime; the SDK talks to them
+  over a single HTTP endpoint with a shared secret.
+
+That layout dictates two design rules:
 
 1. **PII redaction happens in the customer's process.** Doing it
-   server-side would mean raw PII has already crossed the network — the
-   whole point of redaction is that the sensitive bytes never leave the
-   boundary they were created in. The default regex pass runs inline in
-   the SDK; customers can add patterns or plug in stronger redactors
-   (Presidio, NER, an LLM judge). The ingestion worker keeps an opt-in
-   defense-in-depth pass for legacy or non-SDK posters.
+   server-side would mean raw PII has already crossed the network —
+   defeating the point of redaction for any customer with a real
+   compliance posture (HIPAA, GDPR, SOC 2). The default regex pass runs
+   inline in the SDK; customers can add patterns or plug in stronger
+   redactors (Presidio, NER, an LLM judge). The ingestion worker keeps
+   an **opt-in** defense-in-depth pass behind a feature flag for legacy
+   or non-SDK posters; it is off by default.
 
 2. **Integration is one line, truly model-agnostic.** Customers call
-   `inferlog.init(...)` at process startup. The SDK patches
-   `httpx.AsyncClient.send` / `httpx.Client.send` — the universal
-   async transport every modern Python LLM library uses. Any LLM HTTP
-   request — through the OpenAI SDK, Anthropic SDK, raw `httpx` calls
-   to a self-hosted vLLM / Ollama, an OpenAI-compatible proxy, or
-   LangChain / LlamaIndex on top of any of those — is captured. URL
-   patterns identify the provider; per-provider parsers extract model,
-   tokens, output text. There's also an explicit `LoggedLLMClient` for
-   in-process custom providers (which don't go over HTTP — the demo's
-   mock model uses this path), with a contextvar that prevents the two
-   paths from double-logging.
+   `inferlog.init(...)` at process startup. The default
+   (`capture_all_httpx=True`) patches `httpx.AsyncClient.send` /
+   `httpx.Client.send` — the universal async transport every modern
+   Python LLM library uses. Any LLM HTTP request — through the OpenAI
+   SDK, Anthropic SDK, raw `httpx` calls to a self-hosted vLLM / Ollama,
+   an OpenAI-compatible proxy, or LangChain / LlamaIndex on top of any
+   of those — is captured. URL patterns identify the provider; per-
+   provider parsers in `sdk/inferlog/parsers.py` extract model, tokens,
+   output text. Non-LLM httpx traffic in the same process is recognised
+   by the patch and passed through untouched — no event is created, no
+   parser runs, no redactor runs. For surgical opt-in there's also
+   `inferlog.transport()` (attach to specific httpx clients,
+   `capture_all_httpx=False`), and for in-process custom providers
+   `inferlog.wrap_provider(...)` (mocks, in-house inference). All three
+   paths share a contextvar that prevents double-logging.
 
 ## Ingestion flow
 
@@ -101,21 +123,28 @@ The server-side worker keeps an opt-in second pass for defense in depth
 redaction count. Enriched fields (token totals, throughput, cost) are
 computed once at ingest, not on every read.
 
-**SDK integration shape.** Two paths, deliberately:
+**SDK integration shape.** Three paths, all first-class:
 
-1. **HTTP-level capture** (default). A single
+1. **HTTP-level capture** (default — `capture_all_httpx=True`). A single
    `inferlog.init(api_key=..., endpoint=...)` at startup patches
    `httpx.AsyncClient.send` / `httpx.Client.send`. Any LLM call going
    out through `httpx` — OpenAI SDK, Anthropic SDK, raw httpx calls,
-   self-hosted models (vLLM, Ollama), OpenAI-compatible proxies, the
-   long tail — is captured. URL pattern → provider handler →
-   per-provider parser. Adding a new provider is one handler class.
-   Customer's existing code is untouched. Walkthrough:
-   `_notes/http-capture-walkthrough.md`.
-2. **Explicit wrapper.** `LoggedLLMClient` for in-process providers
-   that don't speak HTTP (mock models, custom in-house inference).
-   Shares the global dispatcher and redactor; a contextvar suppresses
-   HTTP capture inside this scope to avoid double-logging.
+   self-hosted models (vLLM, Ollama), OpenAI-compatible proxies — is
+   captured. URL pattern → provider handler → per-provider parser
+   (`sdk/inferlog/parsers.py`). Non-LLM httpx traffic is gated out by
+   URL and passes through untouched. Adding a new provider is one
+   handler class (`add_handler(...)`).
+2. **Per-client transport** (surgical — `capture_all_httpx=False`). For
+   processes where the global patch sitting on every httpx call is
+   unwanted, `inferlog.transport()` returns an `httpx.AsyncBaseTransport`
+   that the customer attaches to specific clients. Same parsers, same
+   redactor, same emit path — but only requests through that client
+   touch our code.
+3. **Explicit wrapper** (`inferlog.wrap_provider(...)`). For in-process
+   providers that don't speak HTTP (mocks, custom in-house inference).
+   Returns a `LoggedLLMClient` wired to the global dispatcher and
+   redactor; a contextvar suppresses HTTP capture inside this scope to
+   avoid double-logging.
 
 **Production-shaped SDK essentials** (built into the same package):
 - Sampling — `KeepAll` / `Probability(rate)` / `AlwaysKeepErrors(inner)`
@@ -124,12 +153,28 @@ computed once at ingest, not on every read.
 - Network resilience — exponential backoff with jitter; honours
   `Retry-After` on 429 / 503.
 - Auth schemes — `x-api-key` (default) or `Authorization: Bearer …`.
+- Per-event size caps — `error_message`, `tags`, `client_metadata` are
+  bounded at the SDK boundary so a buggy call site cannot ship multi-MB
+  events that DoS ingestion. The ingestion service re-validates the
+  same caps (it does not trust the SDK version a customer is on).
 - Shutdown — atexit flush on process exit, async `await ashutdown()` for
   clean drain.
 - Self-observability — `inferlog.stats()` returns queue depth,
   delivered, dropped, closed.
 - Safety — every wrapper is in `try/except`; the SDK will not break the
   host call path.
+
+**Auth on the Ollive side** (`ingestion/app/api.py`):
+- POST `/v1/ingest` requires a shared secret. The SDK presents it as
+  `x-api-key` by default, or `Authorization: Bearer …` if you set
+  `auth_scheme="bearer"` at init. Comparison is constant-time
+  (`hmac.compare_digest`) — no timing-oracle leak of the key.
+- The dashboard read endpoints (`/v1/metrics/*`, `/v1/logs`) require
+  the same secret. The web SPA hits them via nginx, which injects the
+  header on the way through so the browser never sees the key.
+- `/healthz` stays unauthenticated and surfaces stream depth, pending
+  count, and DLQ depth so silent data loss is alarmable from
+  orchestrators or external monitors.
 
 ## Scaling considerations
 

@@ -6,5 +6,10 @@ asyncpg>=0.30
 httpx>=0.27,<1.0
 pydantic>=2.7
 
+# Vendor LLM SDKs the gateway demo calls into. The inferlog SDK has no
+# runtime dep on either — capture is at the httpx layer.
+openai>=1.40,<2.0
+anthropic>=0.39,<1.0
+
 pytest>=8.0
 pytest-asyncio>=0.23

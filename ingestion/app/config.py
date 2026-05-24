@@ -29,7 +29,15 @@ class Settings:
     claim_idle_ms: int = int(os.getenv("WORKER_CLAIM_IDLE_MS", "30000"))
 
     schema_path: str = os.getenv("SCHEMA_PATH", "/app/db/schema.sql")
-    cors_origins: list[str] = field(default_factory=lambda: _csv("CORS_ORIGINS", "*"))
+    # Default to the local dashboard host. Override with CORS_ORIGINS=*
+    # for development against a separate origin (e.g. the vite dev server).
+    # A `*` default would let any site read all customer logs via the
+    # browser — dashboard endpoints are auth-gated, but defence-in-depth.
+    cors_origins: list[str] = field(
+        default_factory=lambda: _csv(
+            "CORS_ORIGINS", "http://localhost:8088,http://localhost:5173"
+        )
+    )
     port: int = int(os.getenv("PORT", "8080"))
 
 

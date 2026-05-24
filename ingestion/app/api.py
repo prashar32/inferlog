@@ -5,17 +5,25 @@ Two jobs:
     publish to the Redis stream. It does NOT touch Postgres; that's the
     worker's job. This keeps the write path fast and decoupled.
   * GET  /v1/metrics/* and /v1/logs — read side for the dashboards.
+
+Auth is a single shared secret (`INGEST_API_KEY`). The SDK presents it
+as `x-api-key` by default; we also accept `Authorization: Bearer …` to
+match the SDK's `auth_scheme="bearer"` option. Comparison is constant
+time. Both write and read endpoints require it — a `*` CORS posture
+plus open metrics endpoints would otherwise leak every customer's logs
+to any browser on the internet.
 """
 
 from __future__ import annotations
 
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
@@ -64,16 +72,35 @@ app.add_middleware(
 )
 
 
-def _require_api_key(provided: str) -> None:
-    if provided != settings.ingest_api_key:
-        raise HTTPException(401, "invalid or missing x-api-key")
+def _extract_bearer(authorization: str) -> str:
+    """Pull the token out of an `Authorization: Bearer <token>` header.
+    Returns "" if the header is empty or not bearer-formatted."""
+    if not authorization:
+        return ""
+    parts = authorization.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return ""
 
 
-@app.post("/v1/ingest", status_code=202, tags=["ingest"])
-async def ingest(batch: IngestBatch, x_api_key: str = Header(default="")):
+def require_api_key(
+    x_api_key: str = Header(default=""),
+    authorization: str = Header(default=""),
+) -> None:
+    """Auth dependency. Accepts `x-api-key` (preferred) or `Authorization:
+    Bearer …`. Comparison is constant-time so the endpoint can't be
+    timing-attacked to recover the key one byte at a time."""
+    expected = settings.ingest_api_key
+    candidate = x_api_key or _extract_bearer(authorization)
+    if not candidate or not hmac.compare_digest(candidate, expected):
+        raise HTTPException(401, "missing or invalid credentials")
+
+
+@app.post("/v1/ingest", status_code=202, tags=["ingest"],
+          dependencies=[Depends(require_api_key)])
+async def ingest(batch: IngestBatch):
     """Accept a batch of inference events. Returns immediately once they're
     on the stream — processing happens asynchronously in the worker."""
-    _require_api_key(x_api_key)
     received_at = datetime.now(timezone.utc).isoformat()
     for event in batch.events:
         payload = event.model_dump(mode="json")
@@ -82,12 +109,14 @@ async def ingest(batch: IngestBatch, x_api_key: str = Header(default="")):
     return {"accepted": len(batch.events)}
 
 
-@app.get("/v1/metrics/summary", tags=["metrics"])
+@app.get("/v1/metrics/summary", tags=["metrics"],
+         dependencies=[Depends(require_api_key)])
 async def metrics_summary(window: int = Query(60, ge=1, le=1440)):
     return await app.state.db.metrics_summary(window)
 
 
-@app.get("/v1/metrics/timeseries", tags=["metrics"])
+@app.get("/v1/metrics/timeseries", tags=["metrics"],
+         dependencies=[Depends(require_api_key)])
 async def metrics_timeseries(
     window: int = Query(60, ge=1, le=1440),
     bucket: int = Query(60, ge=10, le=3600, description="bucket size in seconds"),
@@ -99,12 +128,14 @@ async def metrics_timeseries(
     }
 
 
-@app.get("/v1/metrics/errors", tags=["metrics"])
+@app.get("/v1/metrics/errors", tags=["metrics"],
+         dependencies=[Depends(require_api_key)])
 async def metrics_errors(window: int = Query(60, ge=1, le=1440)):
     return await app.state.db.metrics_errors(window)
 
 
-@app.get("/v1/logs", tags=["logs"])
+@app.get("/v1/logs", tags=["logs"],
+        dependencies=[Depends(require_api_key)])
 async def recent_logs(
     limit: int = Query(50, ge=1, le=200),
     status: str | None = Query(None),
@@ -115,6 +146,8 @@ async def recent_logs(
 
 @app.get("/healthz", tags=["meta"])
 async def healthz():
+    """Unauthenticated health check — used by orchestrators and a single
+    DLQ depth gauge for an alarmable view of silent data loss."""
     db_ok = await app.state.db.ping()
     redis_ok = await app.state.stream.ping()
     body = {"status": "ok" if (db_ok and redis_ok) else "degraded",
@@ -122,4 +155,5 @@ async def healthz():
     if redis_ok:
         body["stream_depth"] = await app.state.stream.depth()
         body["pending"] = await app.state.stream.pending_count()
+        body["dlq_depth"] = await app.state.stream.dlq_depth()
     return body

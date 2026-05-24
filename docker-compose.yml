@@ -107,6 +107,13 @@ services:
     depends_on:
       - gateway
       - ingestion-api
+    environment:
+      # nginx envsubst injects this into default.conf at startup so the
+      # browser never sees the dashboard API key. Restrict envsubst to
+      # just this variable; otherwise it would try to substitute every
+      # nginx-native $directive too.
+      INGEST_API_KEY: ${INGEST_API_KEY:-local-dev-ingest-key}
+      NGINX_ENVSUBST_FILTER: "^INGEST_API_KEY$$"
     ports:
       - "8088:80"
 

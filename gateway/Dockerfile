@@ -6,8 +6,10 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 
 # SDK changes less often than app code — install it on its own layer.
+# The SDK itself has no provider deps; openai/anthropic come from the
+# gateway's own requirements.txt.
 COPY sdk /tmp/sdk
-RUN pip install "/tmp/sdk[openai,anthropic]"
+RUN pip install /tmp/sdk
 
 COPY gateway/requirements.txt ./
 RUN pip install -r requirements.txt
