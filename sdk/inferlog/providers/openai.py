@@ -68,3 +68,8 @@ class OpenAIProvider(Provider):
                 delta = chunk.choices[0].delta.content or ""
             if delta or usage:
                 yield StreamChunk(text=delta, usage=usage)
+
+
+# browser - gateway - ingestion service (submit) ->  model -> sse -> browser
+
+# ingest api -> 25 events, 0.5 -> redis stream -> worker -> postgres

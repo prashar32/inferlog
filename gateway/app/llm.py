@@ -10,7 +10,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from inferlog import HttpSink, LoggedLLMClient, LogDispatcher
+import inferlog
+from inferlog import LoggedLLMClient
 from inferlog.providers import MockProvider, Provider
 
 from .config import Settings
@@ -41,15 +42,26 @@ class LLMRuntime:
     def __init__(
         self,
         client: LoggedLLMClient,
-        dispatcher: LogDispatcher,
         providers: dict[str, Provider],
     ):
         self.client = client
-        self._dispatcher = dispatcher
         self._providers = providers
 
     @classmethod
     def build(cls, settings: Settings) -> "LLMRuntime":
+        # One-line SDK init — sets up the global dispatcher + redactor, AND
+        # auto-instruments any openai/anthropic clients used elsewhere in the
+        # process. PII redaction happens here, before anything leaves us.
+        installed = inferlog.init(
+            service="chat-gateway",
+            endpoint=settings.ingest_url,
+            api_key=settings.ingest_api_key,
+        )
+        log.info("inferlog initialised; auto-instrumented providers: %s", installed)
+
+        rt = inferlog.get_runtime()
+        assert rt is not None  # init() just set it
+
         providers: dict[str, Provider] = {"mock": MockProvider()}
         if settings.openai_api_key:
             from inferlog.providers import OpenAIProvider
@@ -60,19 +72,26 @@ class LLMRuntime:
 
             providers["anthropic"] = AnthropicProvider(api_key=settings.anthropic_api_key)
 
-        log.info("LLM providers enabled: %s", sorted(providers))
-        sink = HttpSink(settings.ingest_url, api_key=settings.ingest_api_key)
-        dispatcher = LogDispatcher(sink)
+        log.info("chat providers enabled: %s", sorted(providers))
+
+        # The explicit LoggedLLMClient shares the global dispatcher and
+        # redactor — both integration paths produce identically-shaped
+        # events. Inside this client, auto-instrumentation is suppressed
+        # via a contextvar to avoid double-logging.
         client = LoggedLLMClient(
-            service="chat-gateway", dispatcher=dispatcher, providers=providers
+            service="chat-gateway",
+            dispatcher=rt.dispatcher,
+            providers=providers,
+            redactor=rt.redactor,
         )
-        return cls(client, dispatcher, providers)
+        return cls(client, providers)
 
     def start(self) -> None:
-        self._dispatcher.start()
+        # init() already started the dispatcher; kept for API compatibility.
+        pass
 
     async def aclose(self) -> None:
-        await self._dispatcher.aclose()
+        await inferlog.ashutdown()
 
     @property
     def available_models(self) -> list[ModelOption]:
@@ -87,4 +106,4 @@ class LLMRuntime:
         return next((m for m in models if m.provider != "mock"), models[-1])
 
     def logging_stats(self) -> dict:
-        return self._dispatcher.stats()
+        return inferlog.stats()

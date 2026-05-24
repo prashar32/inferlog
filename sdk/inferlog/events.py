@@ -36,10 +36,18 @@ class InferenceEvent:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
-    input_preview: str | None = None    # raw here; the worker redacts PII
+    # Previews are redacted INSIDE the SDK before this event leaves the
+    # host process. `pii_redaction_count` is the number of substitutions
+    # performed across all three of input/output/error text.
+    input_preview: str | None = None
     output_preview: str | None = None
     error_type: str | None = None
     error_message: str | None = None
+    pii_redaction_count: int = 0
+    # Free-form tags from `inferlog.context(...)` — conversation_id and
+    # user_id, etc. Conversation_id is also lifted to the dedicated column
+    # above for convenience.
+    tags: dict = field(default_factory=dict)
     client_metadata: dict = field(default_factory=dict)
 
     sdk_version: str = SDK_VERSION

@@ -1,15 +1,19 @@
 # InferLog
 
-A small chatbot with a real inference-logging pipeline behind it.
+A small chatbot with a real inference-logging pipeline behind it, and a
+drop-in SDK that captures every LLM call without the caller having to
+change their code.
 
-You chat with an LLM in the browser; every model call is wrapped by a
-lightweight SDK that captures what happened — latency, tokens, status,
-previews — and ships it to an ingestion service that validates, redacts
-PII, enriches, and stores it. A dashboard reads that back as latency,
-throughput and error charts.
+You chat with an LLM in the browser. Inside the chat backend a one-line
+`inferlog.init(...)` auto-instruments the OpenAI / Anthropic clients so
+every model call is captured — latency, tokens, status, previews — with
+PII redacted **before** the event leaves the process. The event ships to
+an ingestion service that validates, enriches with cost / throughput,
+and stores it. A dashboard reads that back as latency, throughput and
+error charts.
 
-The whole thing runs with one command and no API keys (there's a built-in
-mock model); add an `OPENAI_API_KEY` to talk to a real model.
+The whole thing runs with one command and no API keys (there's a
+built-in mock model); add an `OPENAI_API_KEY` to talk to a real model.
 
 ---
 
@@ -106,6 +110,50 @@ in the background and sheds load if it has to.
 A longer write-up — ingestion flow, failure handling, scaling — is in
 [`docs/architecture.md`](docs/architecture.md).
 
+### Using the SDK in your own app
+
+The SDK is designed to be the thing a customer drops into their own
+backend. Two integration paths:
+
+**1. Auto-instrumentation (one line, recommended).**
+
+```python
+import inferlog
+inferlog.init(
+    service="my-app",
+    endpoint="https://ingest.example.com/v1/ingest",
+    api_key="...",
+)
+
+# Your existing code is unchanged — auto-captured:
+resp = await openai_client.chat.completions.create(model="gpt-4o-mini", ...)
+
+# Optional: tag a scope so the events carry context
+with inferlog.context(conversation_id=cid, user_id=uid, tenant_id=tid):
+    await openai_client.chat.completions.create(...)
+```
+
+`init()` returns the list of providers it actually instrumented
+(`openai`, `anthropic`); auto-instrumentation only patches libraries that
+are importable in your process.
+
+**2. Explicit wrapper.** For custom or in-house providers there's
+`LoggedLLMClient`. It shares the same dispatcher + redactor, so events
+look identical regardless of which path produced them.
+
+The SDK ships with the production essentials you'd expect:
+
+| Concern | What you get |
+|---|---|
+| **PII redaction** | Default regex pass (email, phone, card, SSN, IP, API key); extensible (`extra_patterns=…`); replaceable (`custom=…` callable for Presidio / NER / your own classifier) |
+| **Sampling** | `KeepAll` (default), `Probability(rate)`, `AlwaysKeepErrors(inner)`, `CustomSampler(fn)` |
+| **Backpressure** | Bounded queue with `on_drop(count, reason)` callback; reasons: `queue_full`, `max_retries`, `permanent_error`, `sampled` |
+| **Network resilience** | Retry with exponential backoff + jitter; honours `Retry-After` on 429 / 503 |
+| **Auth** | `auth_scheme="x-api-key"` (default) or `"bearer"` |
+| **Shutdown** | `atexit` flush on process exit; `await inferlog.ashutdown()` for clean async drain |
+| **Observability of the logger itself** | `inferlog.stats()` returns queue depth, delivered, dropped, closed |
+| **Safety** | Every wrapper is in `try/except` — the SDK will not break your call path |
+
 ### Repo layout
 
 ```
@@ -166,14 +214,14 @@ Things I'd do differently with more time, or chose deliberately:
   reason about. The no-FK decision keeps the coupling honest.
 - **PII redaction is regex-based and best-effort.** It reliably catches
   emails, phone numbers, cards, SSNs, IPs and API-key-shaped strings. It
-  will miss names, addresses, and anything novel. Real redaction wants a
-  proper classifier — but a fast, predictable pass on every event is the
-  right *first* line of defence.
-- **Redaction happens in the worker, not the SDK.** That means a raw
-  (short) preview crosses the wire to the ingestion service before being
-  redacted. The upside is one obvious place to audit and change redaction.
-  In a stricter environment I'd redact at the SDK source so raw PII never
-  leaves the app process.
+  will miss names, addresses, and anything novel. The SDK exposes a
+  pluggable interface — wire up Microsoft Presidio, spaCy NER, or an LLM
+  judge for richer coverage. A fast, predictable pass on every event is
+  still the right *first* line of defence.
+- **Redaction runs inside the SDK, in the host process.** Raw PII never
+  crosses the wire. The ingestion worker keeps an opt-in defense-in-depth
+  pass (`INGEST_DEFENSE_IN_DEPTH_REDACT=true`) for legacy or non-SDK
+  posters, but it's off by default — the SDK owns the contract.
 - **The worker DLQs and continues on a processing error** rather than
   retrying transient failures. It keeps one bad event from wedging the
   stream, and the DLQ is the audit trail — but a genuinely transient DB

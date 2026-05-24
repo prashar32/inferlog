@@ -35,10 +35,16 @@ class IngestEvent(BaseModel):
     prompt_tokens: int | None = Field(default=None, ge=0)
     completion_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
+    # Previews arrive ALREADY REDACTED — the SDK does that in-process so
+    # raw PII never crosses the wire. `pii_redaction_count` tells us how
+    # many substitutions happened.
     input_preview: str | None = None
     output_preview: str | None = None
     error_type: str | None = None
     error_message: str | None = None
+    pii_redaction_count: int = Field(default=0, ge=0)
+    # Free-form tags from `inferlog.context(...)` on the SDK side.
+    tags: dict = Field(default_factory=dict)
     client_metadata: dict = Field(default_factory=dict)
 
     sdk_version: str | None = None

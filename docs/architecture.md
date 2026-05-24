@@ -1,7 +1,28 @@
 # Architecture notes
 
-Companion to the README. This covers the four things the brief asked for:
-ingestion flow, logging strategy, scaling, and failure handling.
+Companion to the README. Covers the four things the brief asked for —
+ingestion flow, logging strategy, scaling, failure handling — plus the
+SDK contract a customer integrates against.
+
+## The product picture
+
+The SDK lives **inside the customer's application**, not inside our
+infrastructure. That single fact dictates two design rules:
+
+1. **PII redaction happens in the customer's process.** Doing it
+   server-side would mean raw PII has already crossed the network — the
+   whole point of redaction is that the sensitive bytes never leave the
+   boundary they were created in. The default regex pass runs inline in
+   the SDK; customers can add patterns or plug in stronger redactors
+   (Presidio, NER, an LLM judge). The ingestion worker keeps an opt-in
+   defense-in-depth pass for legacy or non-SDK posters.
+
+2. **Integration is one line, model-agnostic.** Customers call
+   `inferlog.init(...)` at process startup. The SDK monkey-patches
+   `openai.chat.completions.create` and `anthropic.messages.create` —
+   their existing code is unchanged. There's also an explicit
+   `LoggedLLMClient` for custom or in-house providers, and a contextvar
+   prevents the two paths from double-logging.
 
 ## Ingestion flow
 
@@ -63,8 +84,41 @@ truncated input/output previews. Token classification of errors into a
 small stable set (`rate_limit`, `timeout`, `auth`, …) happens in the SDK so
 the dashboards can group on it.
 
-**What's stored:** the worker never stores a raw preview — PII is redacted
-first. Enriched fields are computed once at ingest, not on every read.
+**Where PII redaction happens.** Inside the SDK, in the customer's
+process, before the event reaches the dispatcher queue. Raw bytes never
+cross the wire. Default is a regex pass; customers can extend (extra
+patterns) or replace (a custom callable for Presidio / NER / LLM judge).
+The server-side worker keeps an opt-in second pass for defense in depth
+(`INGEST_DEFENSE_IN_DEPTH_REDACT=true`), off by default.
+
+**What's stored:** already-redacted previews plus the SDK-supplied
+redaction count. Enriched fields (token totals, throughput, cost) are
+computed once at ingest, not on every read.
+
+**SDK integration shape.** Two paths, deliberately:
+
+1. **Auto-instrumentation** (default for OpenAI and Anthropic). A single
+   `inferlog.init(api_key=..., endpoint=...)` at startup monkey-patches
+   `chat.completions.create` and `messages.create`. The customer's
+   existing code is unchanged.
+2. **Explicit wrapper.** `LoggedLLMClient` for custom / in-house
+   providers (or for callers that prefer not to monkey-patch). Both
+   paths share the global dispatcher and redactor; a contextvar in the
+   explicit wrapper suppresses auto-capture to avoid double-logging.
+
+**Production-shaped SDK essentials** (built into the same package):
+- Sampling — `KeepAll` / `Probability(rate)` / `AlwaysKeepErrors(inner)`
+  / `CustomSampler(fn)`.
+- Backpressure visibility — `on_drop(count, reason)` callback.
+- Network resilience — exponential backoff with jitter; honours
+  `Retry-After` on 429 / 503.
+- Auth schemes — `x-api-key` (default) or `Authorization: Bearer …`.
+- Shutdown — atexit flush on process exit, async `await ashutdown()` for
+  clean drain.
+- Self-observability — `inferlog.stats()` returns queue depth,
+  delivered, dropped, closed.
+- Safety — every wrapper is in `try/except`; the SDK will not break the
+  host call path.
 
 ## Scaling considerations
 

@@ -34,14 +34,41 @@ async def test_worker_is_idempotent_on_redelivery(stream, db):
     assert len(logs) == 1
 
 
-async def test_worker_redacts_pii_before_storing(stream, db):
-    await stream.publish(event_payload(input_preview="reach me at x@y.com"))
+async def test_worker_preserves_pre_redacted_previews(stream, db):
+    """The SDK redacts on the client side; the worker must NOT re-do that
+    work (it can't recover the original) and must preserve the count."""
+    await stream.publish(event_payload(
+        input_preview="reach me at [REDACTED_EMAIL] please",
+        pii_redaction_count=1,
+    ))
 
     await _drain(stream, db)
 
     logs = await db.recent_logs(10, None, None)
-    assert "x@y.com" not in logs[0]["input_preview"]
+    assert logs[0]["input_preview"] == "reach me at [REDACTED_EMAIL] please"
     assert logs[0]["pii_redaction_count"] == 1
+
+
+async def test_worker_optional_defense_in_depth_redacts(monkeypatch):
+    """If a legacy or non-SDK source posts raw PII, an env flag turns on a
+    server-side second pass. Off by default. Unit-tested directly via
+    process_event since the flag is read at module-import time."""
+    monkeypatch.setenv("INGEST_DEFENSE_IN_DEPTH_REDACT", "true")
+    import importlib
+    from app import processing as proc_mod
+    importlib.reload(proc_mod)
+    try:
+        from app.events import IngestEvent
+        evt = IngestEvent.model_validate(event_payload(
+            input_preview="raw email a@b.com leaked",
+            pii_redaction_count=0,
+        ))
+        record = proc_mod.process_event(evt)
+        assert "a@b.com" not in (record["input_preview"] or "")
+        assert record["pii_redaction_count"] >= 1
+    finally:
+        monkeypatch.delenv("INGEST_DEFENSE_IN_DEPTH_REDACT", raising=False)
+        importlib.reload(proc_mod)
 
 
 async def test_worker_sends_malformed_event_to_dlq(stream, db):

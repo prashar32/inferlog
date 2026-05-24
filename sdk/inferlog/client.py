@@ -14,9 +14,13 @@ import time
 from typing import AsyncIterator
 from uuid import uuid4
 
+from .auto import mark_explicit_logging, unmark_explicit_logging
+from .context import current_tags
 from .dispatcher import LogDispatcher
 from .events import InferenceEvent, utcnow
 from .providers import ChatMessage, Completion, Provider, StreamChunk, Usage
+from .redaction import Redactor
+from .runtime import get_runtime
 
 log = logging.getLogger("inferlog.client")
 
@@ -64,6 +68,7 @@ class LoggedLLMClient:
         dispatcher: LogDispatcher,
         providers: dict[str, Provider],
         preview_chars: int = _PREVIEW_CHARS,
+        redactor: Redactor | None = None,
     ):
         if not providers:
             raise ValueError("LoggedLLMClient needs at least one provider")
@@ -71,6 +76,7 @@ class LoggedLLMClient:
         self._dispatcher = dispatcher
         self._providers = providers
         self._preview_chars = preview_chars
+        self._redactor = redactor or Redactor()
 
     @property
     def providers(self) -> list[str]:
@@ -101,6 +107,9 @@ class LoggedLLMClient:
         clock = time.monotonic()
         status, error_type, error_message = "success", None, None
         result: Completion | None = None
+        # Tell auto-instrumentation to back off — we're the explicit logger
+        # for this call. Prevents double-logging when openai is patched.
+        explicit_token = mark_explicit_logging()
         try:
             result = await prov.complete(model, messages, **opts)
             return result
@@ -112,6 +121,7 @@ class LoggedLLMClient:
             error_message = str(exc)[:500]
             raise
         finally:
+            unmark_explicit_logging(explicit_token)
             self._emit(
                 request_id=request_id,
                 conversation_id=conversation_id,
@@ -149,6 +159,7 @@ class LoggedLLMClient:
         ttft_ms: int | None = None
         usage = Usage()
         collected: list[str] = []
+        explicit_token = mark_explicit_logging()
         try:
             async for chunk in prov.stream(model, messages, **opts):
                 if chunk.text:
@@ -188,6 +199,7 @@ class LoggedLLMClient:
                 error_message=error_message,
                 metadata=metadata or {},
             )
+            unmark_explicit_logging(explicit_token)
 
     def _emit(
         self,
@@ -208,6 +220,18 @@ class LoggedLLMClient:
         error_message: str | None,
         metadata: dict,
     ) -> None:
+        # Redact previews BEFORE the event leaves this process. This is the
+        # contract — raw PII never crosses the wire.
+        redacted_input, in_n = self._redactor.redact(input_preview)
+        redacted_output, out_n = self._redactor.redact(output_preview)
+        redacted_error, err_n = self._redactor.redact(error_message)
+
+        tags = current_tags()
+        # If a caller used `inferlog.context(conversation_id=...)` and didn't
+        # pass conversation_id explicitly, honour the context value.
+        if conversation_id is None and "conversation_id" in tags:
+            conversation_id = str(tags["conversation_id"])
+
         event = InferenceEvent(
             request_id=request_id,
             service=self._service,
@@ -223,10 +247,19 @@ class LoggedLLMClient:
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             total_tokens=usage.total_tokens,
-            input_preview=input_preview,
-            output_preview=output_preview,
+            input_preview=redacted_input,
+            output_preview=redacted_output,
             error_type=error_type,
-            error_message=error_message,
+            error_message=redacted_error,
+            pii_redaction_count=in_n + out_n + err_n,
+            tags=tags,
             client_metadata=metadata,
         )
+        # Honour the global runtime's sampler if init() was called. The
+        # explicit-wrapper path otherwise keeps every event.
+        rt = get_runtime()
+        if rt is not None and not rt.sampler.should_sample(event):
+            self._dispatcher.dropped += 1
+            self._dispatcher._notify_drop(1, "sampled")  # type: ignore[attr-defined]
+            return
         self._dispatcher.submit(event)

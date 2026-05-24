@@ -62,7 +62,6 @@ async def client(db, sink):
     providers = {"mock": MockProvider(token_delay=0.02)}
     llm = LLMRuntime(
         LoggedLLMClient(service="test-gateway", dispatcher=dispatcher, providers=providers),
-        dispatcher,
         providers,
     )
     app.state.db = db
