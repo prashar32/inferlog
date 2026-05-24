@@ -34,10 +34,17 @@ def _openai_completion(content: str, prompt_tokens: int = 10, completion_tokens:
     }
 
 
-def _make_openai_with_mock(handler):
+def _make_openai_with_mock(handler, *, max_retries: int = 0):
+    """Build an AsyncOpenAI client with our mock transport. `max_retries=0`
+    by default — otherwise the SDK retries 429/5xx and we'd see multiple
+    events per logical call."""
     from openai import AsyncOpenAI
     transport = httpx.MockTransport(handler)
-    return AsyncOpenAI(api_key="test", http_client=httpx.AsyncClient(transport=transport))
+    return AsyncOpenAI(
+        api_key="test",
+        http_client=httpx.AsyncClient(transport=transport),
+        max_retries=max_retries,
+    )
 
 
 @pytest.fixture
@@ -53,8 +60,9 @@ async def sink_and_init():
 
 async def test_init_reports_installed_providers(sink_and_init):
     _, installed = sink_and_init
-    # openai and anthropic are installed in this venv
-    assert "openai" in installed
+    # HTTP-level instrumentation patches httpx — that's the single,
+    # provider-agnostic capture point.
+    assert installed == ["httpx"]
 
 
 async def test_openai_non_streaming_is_captured(sink_and_init):

@@ -1,32 +1,29 @@
 """inferlog — turn any LLM call into a structured inference log without
 the caller having to think about it.
 
-Two ways to integrate:
+Integration is one line — `inferlog.init(...)` at process startup.
+After that, **any LLM call going through `httpx` is captured**: the
+official OpenAI / Anthropic SDKs (they use httpx), raw httpx requests,
+OpenAI-compatible proxies (vLLM, OpenRouter, Together, LiteLLM proxy,
+Anyscale), Ollama, and any provider you register a handler for.
 
-  1. **One-line auto-instrumentation** (recommended for most apps):
+The customer's call sites are unchanged. They never name the provider
+or pass our objects around — we capture below them at the HTTP layer.
 
-         import inferlog
-         inferlog.init(api_key=..., endpoint="https://ingest.example.com/v1/ingest")
+    import inferlog
+    inferlog.init(api_key=..., endpoint="https://ingest.example.com/v1/ingest")
 
-         # Existing OpenAI / Anthropic code is unchanged and now logged:
-         resp = await openai_client.chat.completions.create(...)
+    # Existing OpenAI / Anthropic / Ollama / Bedrock code is unchanged:
+    resp = await openai_client.chat.completions.create(...)
+    resp = await anthropic_client.messages.create(...)
 
-         # Optional: tag a scope (no per-call code change)
-         with inferlog.context(conversation_id=cid, user_id=uid):
-             ...
+    # Optional: tag a scope so every event in it carries the context.
+    with inferlog.context(conversation_id=cid, user_id=uid):
+        await openai_client.chat.completions.create(...)
 
-  2. **Explicit wrapper** (for custom providers or when you want manual
-     control):
-
-         from inferlog import LoggedLLMClient, LogDispatcher, HttpSink
-         dispatcher = LogDispatcher(HttpSink("http://..."))
-         dispatcher.start()
-         client = LoggedLLMClient(service=..., dispatcher=dispatcher,
-                                  providers={"mock": MockProvider()})
-         async for chunk in client.stream(...): ...
-
-PII redaction runs INSIDE the host process for both paths — raw bytes
-never cross the wire.
+For in-process providers that don't speak HTTP (custom / mock), there's
+an explicit-wrapper path via `LoggedLLMClient`. PII redaction runs
+in-process for both paths — raw bytes never cross the wire.
 """
 
 from __future__ import annotations
@@ -38,6 +35,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from . import auto as _auto
+from .auto import transport
 from .client import LoggedLLMClient
 from .context import context, current_tags
 from .dispatcher import (
@@ -95,8 +93,10 @@ def init(
     auth_scheme: str = "x-api-key",
     sink: Any = None,
     dispatcher_options: dict | None = None,
-    instrument: bool = True,
+    capture_all_httpx: bool = True,
     register_atexit: bool = True,
+    # backward-compat alias for the prior name
+    instrument: bool | None = None,
 ) -> list[str]:
     """Initialise InferLog. Call once at process startup.
 
@@ -128,9 +128,15 @@ def init(
     dispatcher_options:
         Forwarded to :class:`LogDispatcher` (max_queue, batch_size,
         flush_interval, max_retries).
-    instrument:
-        If True (default), auto-instrument ``openai`` and ``anthropic``
-        client libraries that are importable in this process.
+    capture_all_httpx:
+        If ``True`` (default), patch ``httpx.AsyncClient.send`` and
+        ``httpx.Client.send`` globally — every LLM call going through
+        httpx in this process is captured automatically. **Tradeoff:**
+        our code sits in the path of every httpx call (it's fast and
+        defensive, but it's there). If you'd rather have zero coupling
+        with unrelated httpx traffic, set this to ``False`` and attach
+        :func:`inferlog.transport` to the specific httpx clients you
+        want instrumented.
     register_atexit:
         If True (default), register an ``atexit`` hook to flush remaining
         events before process exit. Best-effort.
@@ -138,7 +144,9 @@ def init(
     Returns
     -------
     list[str]
-        The provider libraries actually auto-instrumented.
+        The transports actually instrumented (``["httpx"]`` when
+        ``capture_all_httpx`` is on; ``[]`` otherwise — the customer is
+        expected to attach :func:`inferlog.transport` manually).
 
     Raises
     ------
@@ -146,6 +154,8 @@ def init(
         If ``endpoint`` is set but not a valid http(s) URL, or
         ``auth_scheme`` is unknown.
     """
+    if instrument is not None:
+        capture_all_httpx = instrument  # honour the old param name
     _validate_init_args(endpoint, auth_scheme)
 
     existing = get_runtime()
@@ -177,7 +187,7 @@ def init(
         service, enabled, endpoint or "<null>",
     )
 
-    if not instrument or not enabled:
+    if not capture_all_httpx or not enabled:
         return []
     return _auto.install(rt)
 
@@ -275,7 +285,7 @@ def stats() -> dict:
 
 __all__ = [
     # Public API
-    "init", "shutdown", "ashutdown", "flush", "stats", "context",
+    "init", "shutdown", "ashutdown", "flush", "stats", "context", "transport",
     # Building blocks customers compose
     "Redactor", "Runtime",
     "Sampler", "KeepAll", "Probability", "AlwaysKeepErrors", "CustomSampler",

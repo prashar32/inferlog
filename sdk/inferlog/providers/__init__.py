@@ -1,8 +1,17 @@
+"""Provider primitives used by the explicit-wrapper path (LoggedLLMClient).
+
+The OpenAI and Anthropic adapters that used to live here were removed in
+v0.3 — model-agnostic capture is now HTTP-level (see `inferlog.auto`), so
+the customer uses the native vendor SDKs directly and we capture below
+them. The only adapter kept here is `MockProvider`, used by the demo's
+offline path (which doesn't go over HTTP).
+
+To register a fully custom in-process provider, subclass `Provider` and
+pass it to `LoggedLLMClient(providers={"my-llm": MyProvider()})`.
+"""
+
 from .base import ChatMessage, Completion, Provider, StreamChunk, Usage
 from .mock import MockProvider
-
-# OpenAI / Anthropic adapters are imported lazily: importing this package
-# should not require the vendor SDKs to be installed.
 
 __all__ = [
     "ChatMessage",
@@ -11,18 +20,4 @@ __all__ = [
     "StreamChunk",
     "Usage",
     "MockProvider",
-    "OpenAIProvider",
-    "AnthropicProvider",
 ]
-
-
-def __getattr__(name: str):
-    if name == "OpenAIProvider":
-        from .openai import OpenAIProvider
-
-        return OpenAIProvider
-    if name == "AnthropicProvider":
-        from .anthropic import AnthropicProvider
-
-        return AnthropicProvider
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

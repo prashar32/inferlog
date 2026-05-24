@@ -17,12 +17,18 @@ infrastructure. That single fact dictates two design rules:
    (Presidio, NER, an LLM judge). The ingestion worker keeps an opt-in
    defense-in-depth pass for legacy or non-SDK posters.
 
-2. **Integration is one line, model-agnostic.** Customers call
-   `inferlog.init(...)` at process startup. The SDK monkey-patches
-   `openai.chat.completions.create` and `anthropic.messages.create` —
-   their existing code is unchanged. There's also an explicit
-   `LoggedLLMClient` for custom or in-house providers, and a contextvar
-   prevents the two paths from double-logging.
+2. **Integration is one line, truly model-agnostic.** Customers call
+   `inferlog.init(...)` at process startup. The SDK patches
+   `httpx.AsyncClient.send` / `httpx.Client.send` — the universal
+   async transport every modern Python LLM library uses. Any LLM HTTP
+   request — through the OpenAI SDK, Anthropic SDK, raw `httpx` calls
+   to a self-hosted vLLM / Ollama, an OpenAI-compatible proxy, or
+   LangChain / LlamaIndex on top of any of those — is captured. URL
+   patterns identify the provider; per-provider parsers extract model,
+   tokens, output text. There's also an explicit `LoggedLLMClient` for
+   in-process custom providers (which don't go over HTTP — the demo's
+   mock model uses this path), with a contextvar that prevents the two
+   paths from double-logging.
 
 ## Ingestion flow
 
@@ -97,14 +103,19 @@ computed once at ingest, not on every read.
 
 **SDK integration shape.** Two paths, deliberately:
 
-1. **Auto-instrumentation** (default for OpenAI and Anthropic). A single
-   `inferlog.init(api_key=..., endpoint=...)` at startup monkey-patches
-   `chat.completions.create` and `messages.create`. The customer's
-   existing code is unchanged.
-2. **Explicit wrapper.** `LoggedLLMClient` for custom / in-house
-   providers (or for callers that prefer not to monkey-patch). Both
-   paths share the global dispatcher and redactor; a contextvar in the
-   explicit wrapper suppresses auto-capture to avoid double-logging.
+1. **HTTP-level capture** (default). A single
+   `inferlog.init(api_key=..., endpoint=...)` at startup patches
+   `httpx.AsyncClient.send` / `httpx.Client.send`. Any LLM call going
+   out through `httpx` — OpenAI SDK, Anthropic SDK, raw httpx calls,
+   self-hosted models (vLLM, Ollama), OpenAI-compatible proxies, the
+   long tail — is captured. URL pattern → provider handler →
+   per-provider parser. Adding a new provider is one handler class.
+   Customer's existing code is untouched. Walkthrough:
+   `_notes/http-capture-walkthrough.md`.
+2. **Explicit wrapper.** `LoggedLLMClient` for in-process providers
+   that don't speak HTTP (mock models, custom in-house inference).
+   Shares the global dispatcher and redactor; a contextvar suppresses
+   HTTP capture inside this scope to avoid double-logging.
 
 **Production-shaped SDK essentials** (built into the same package):
 - Sampling — `KeepAll` / `Probability(rate)` / `AlwaysKeepErrors(inner)`

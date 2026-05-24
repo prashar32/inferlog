@@ -16,11 +16,11 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
-from inferlog import LoggedLLMClient, LogDispatcher, MemorySink
-from inferlog.providers import MockProvider
+import inferlog
+from inferlog import MemorySink
 
 from app.db import Database
-from app.llm import LLMRuntime
+from app.llm import LLMRuntime, MockChatProvider
 from app.main import app
 
 def _load_schema() -> str:
@@ -55,22 +55,24 @@ async def sink():
 
 @pytest_asyncio.fixture
 async def client(db, sink):
-    # Small token delay so streaming has several steps — enough for the
-    # cancellation test to interrupt mid-stream.
-    dispatcher = LogDispatcher(sink, flush_interval=0.05)
-    dispatcher.start()
-    providers = {"mock": MockProvider(token_delay=0.02)}
-    llm = LLMRuntime(
-        LoggedLLMClient(service="test-gateway", dispatcher=dispatcher, providers=providers),
-        providers,
+    # The mock provider goes through the explicit-wrapper path inside the
+    # runtime; events land in the in-memory sink we pass to init().
+    inferlog.init(
+        service="test-gateway",
+        sink=sink,
+        dispatcher_options={"flush_interval": 0.05},
+        register_atexit=False,
     )
-    app.state.db = db
-    app.state.llm = llm
+    try:
+        llm = LLMRuntime(providers={"mock": MockChatProvider()})
+        app.state.db = db
+        app.state.llm = llm
 
-    transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
-    await dispatcher.aclose()
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+    finally:
+        await inferlog.ashutdown()
 
 
 async def create_conversation(client: httpx.AsyncClient, model: str = "mock-1") -> str:

@@ -16,12 +16,12 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from inferlog.providers import ChatMessage
+import inferlog
 
 from .config import settings
 from .db import Database
 from .deps import get_db, get_llm
-from .llm import LLMRuntime
+from .llm import ChatMessage, LLMRuntime
 from .models import SendMessageRequest
 
 log = logging.getLogger("gateway.chat")
@@ -113,13 +113,20 @@ async def send_message(
         usage = None
         yield _sse("start", {"request_id": request_id})
 
-        sdk_stream = llm.client.stream(
+        # The gateway's LLMRuntime.stream returns a normalised async
+        # iterator of StreamChunk(text, usage) regardless of which
+        # provider is underneath. OpenAI / Anthropic chunks are produced
+        # via native SDKs (HTTP-captured by inferlog); the mock provider
+        # goes through the explicit-wrapper path inside the runtime.
+        #
+        # inferlog.context() attaches the conversation_id to every event
+        # emitted in this scope — works for both capture paths.
+        ctx = inferlog.context(conversation_id=str(conversation_id))
+        ctx.__enter__()
+        sdk_stream = llm.stream(
             provider=conv["provider"],
             model=conv["model"],
             messages=context,
-            conversation_id=str(conversation_id),
-            request_id=request_id,
-            metadata={"channel": "web"},
         )
         try:
             async for chunk in sdk_stream:
@@ -156,5 +163,11 @@ async def send_message(
                 await sdk_stream.aclose()
             except Exception:
                 log.debug("sdk stream close raised", exc_info=True)
+            # Pop the inferlog.context scope. No-raise — just resets the
+            # contextvar token.
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                log.debug("inferlog context exit raised", exc_info=True)
 
     return StreamingResponse(stream(), media_type="text/event-stream")

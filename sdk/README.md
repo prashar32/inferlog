@@ -1,11 +1,18 @@
 # inferlog
 
-A drop-in SDK that turns LLM provider calls into structured inference
-logs. The host app does not have to change its code — one call to
-`inferlog.init(...)` patches the OpenAI and Anthropic clients and every
-subsequent call is captured.
+A drop-in SDK that turns any LLM call into a structured inference log
+without changing the host's code. One `inferlog.init(...)` at startup
+and every model call going out through `httpx` is captured —
+regardless of which library or which provider is in use.
 
 The core stays small. Only required dependency: `httpx`.
+
+**Model-agnostic by construction.** Capture is at the HTTP layer, not
+the library layer. OpenAI's SDK, Anthropic's SDK, raw `httpx` calls to
+self-hosted models (vLLM, Ollama, llama.cpp), OpenAI-compatible proxies
+(OpenRouter, Together, LiteLLM proxy), LangChain, LlamaIndex — all the
+same code path. Customers don't write per-provider integration; they
+just write their LLM calls.
 
 ## Install
 
@@ -131,8 +138,12 @@ pip install -e ".[dev]"
 pytest
 ```
 
-42 unit tests covering the dispatcher (batching, retry, jitter,
-retry-after, drops, lazy start), the client wrapper (cancellation,
-error classification, redaction), sampling, the HTTP sink (auth schemes,
-transient errors), and auto-instrumentation (success / error / streaming
-/ context tags) against a mocked OpenAI HTTP layer.
+49 unit tests covering:
+* dispatcher (batching, retry, jitter, retry-after, drops, lazy start);
+* the explicit-wrapper client (cancellation, error classification,
+  redaction);
+* sampling and the HTTP sink (auth schemes, transient errors);
+* **HTTP-level capture across four provider shapes** — OpenAI,
+  Anthropic, Ollama (NDJSON), and OpenAI-compatible — plus a raw httpx
+  call with no SDK at all, and a negative test that non-LLM POSTs pass
+  through uncaptured.

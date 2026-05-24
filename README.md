@@ -5,12 +5,13 @@ drop-in SDK that captures every LLM call without the caller having to
 change their code.
 
 You chat with an LLM in the browser. Inside the chat backend a one-line
-`inferlog.init(...)` auto-instruments the OpenAI / Anthropic clients so
-every model call is captured — latency, tokens, status, previews — with
-PII redacted **before** the event leaves the process. The event ships to
-an ingestion service that validates, enriches with cost / throughput,
-and stores it. A dashboard reads that back as latency, throughput and
-error charts.
+`inferlog.init(...)` patches `httpx`, so every outgoing LLM HTTP call
+— OpenAI SDK, Anthropic SDK, raw httpx to Ollama / vLLM / OpenAI-compatible
+proxies — is captured at the transport layer. Each event records
+latency, tokens, status, previews, with PII redacted **before** the
+event leaves the process. The event ships to an ingestion service that
+validates, enriches with cost / throughput, and stores it. A dashboard
+reads that back as latency, throughput and error charts.
 
 The whole thing runs with one command and no API keys (there's a
 built-in mock model); add an `OPENAI_API_KEY` to talk to a real model.

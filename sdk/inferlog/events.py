@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-SDK_VERSION = "0.1.0"
+SDK_VERSION = "0.3.0"
 SCHEMA_VERSION = 1
 
 
